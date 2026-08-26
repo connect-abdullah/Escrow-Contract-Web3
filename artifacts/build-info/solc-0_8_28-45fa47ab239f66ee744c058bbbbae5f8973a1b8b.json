@@ -1,0 +1,42 @@
+{
+  "_format": "hh3-sol-build-info-1",
+  "id": "solc-0_8_28-45fa47ab239f66ee744c058bbbbae5f8973a1b8b",
+  "solcVersion": "0.8.28",
+  "solcLongVersion": "0.8.28+commit.7893614a",
+  "compilerType": "solc",
+  "userSourceNameMap": {
+    "contracts/EscrowContract.sol": "project/contracts/EscrowContract.sol"
+  },
+  "input": {
+    "language": "Solidity",
+    "settings": {
+      "evmVersion": "cancun",
+      "outputSelection": {
+        "*": {
+          "": [
+            "ast"
+          ],
+          "*": [
+            "abi",
+            "evm.bytecode.linkReferences",
+            "evm.bytecode.object",
+            "evm.bytecode.opcodes",
+            "evm.bytecode.sourceMap",
+            "evm.deployedBytecode.immutableReferences",
+            "evm.deployedBytecode.linkReferences",
+            "evm.deployedBytecode.object",
+            "evm.deployedBytecode.opcodes",
+            "evm.deployedBytecode.sourceMap",
+            "evm.methodIdentifiers"
+          ]
+        }
+      },
+      "remappings": []
+    },
+    "sources": {
+      "project/contracts/EscrowContract.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.28;\n\ncontract EscrowContract {\n    enum Status {\n        EMPTY,\n        FUNDED,\n        RELEASED,\n        REFUNDED\n    }\n\n    struct Escrow {\n        uint256 escrowId;\n        address buyer;\n        address seller;\n        uint256 amount;\n        Status status;\n        bool exists;\n    }\n\n    mapping(uint256 => Escrow) public escrows;\n\n    event EscrowCreated(uint256 indexed escrowId, address indexed buyer, address seller);\n    event FundsFunded(uint256 indexed escrowId, address indexed buyer, address seller, uint256 amount);\n    event FundsReleased(uint256 indexed escrowId, address indexed buyer, address seller, uint256 amount);\n    event FundsRefunded(uint256 indexed escrowId, address indexed buyer, uint256 amount);\n\n    function createEscrow(uint256 _escrowId, address _seller) public {\n        // Few Checks:\n        // 1. Buyer and seller cannot be the same\n        require(msg.sender != _seller, \"You cannot create an escrow with yourself\");\n        // 2. Escrow must not exist\n        require(!escrows[_escrowId].exists, \"Escrow already exists\");\n\n        escrows[_escrowId] = Escrow({\n            escrowId: _escrowId,\n            buyer: msg.sender,\n            seller: _seller,\n            amount: 0,\n            status: Status.EMPTY,\n            exists: true\n        });\n\n        emit EscrowCreated(_escrowId, msg.sender, _seller);\n    }\n\n    function depositFunds(uint256 _escrowId) payable public {\n        Escrow storage e = escrows[_escrowId];\n\n        // Few Checks:\n        // 1. Escrow must exist\n        require(e.exists, \"Escrow does not exist\");\n        // 2. Only the buyer can deposit funds\n        require(e.buyer == msg.sender, \"Only the buyer can deposit funds\");\n        // 3. Amount must be greater than 0\n        require(msg.value > 0, \"Amount must be greater than 0\");\n        // 4. Escrow must be empty\n        require(e.status == Status.EMPTY, \"Escrow not empty\");\n\n        e.status = Status.FUNDED;\n        e.amount = msg.value;\n        emit FundsFunded(_escrowId, msg.sender, e.seller, msg.value);\n    }\n\n    // Only Buyer can release/refund funds\n    function releaseFunds(uint256 _escrowId) public {\n        Escrow storage e = escrows[_escrowId];\n\n        // Few Checks:\n        // 1. Escrow must exist\n        require(e.exists, \"Escrow does not exist\");\n        // 2. Only the buyer can release funds\n        require(e.buyer == msg.sender, \"Only the buyer can release funds\");\n        // 3. Escrow must be funded\n        require(e.status == Status.FUNDED, \"Escrow not funded\");\n\n        // External call: sends ETH to the buyer's address.\n        // State is updated before this call to prevent reentrancy attacks.\n\n        // Effects: Update state before interacting with external accounts\n        e.status = Status.RELEASED;\n        uint256 amount = e.amount;\n        e.amount = 0; // Zero out the amount before sending\n\n        emit FundsReleased(_escrowId, msg.sender, e.seller, amount);\n        // Interactions: External call last (Checks-Effects-Interactions pattern)\n        // e.seller = seller address\n        (bool success, ) = payable(e.seller).call{value: amount}(\"\");\n        require(success, \"Failed to release funds\"); // Revert the transaction if failed\n    }\n    \n    function refundFunds(uint256 _escrowId) public {\n        Escrow storage e = escrows[_escrowId];\n\n        // Few Checks:\n        // 1. Escrow must exist\n        require(e.exists, \"Escrow does not exist\");\n        // 2. Only the buyer can refund funds\n        require(e.buyer == msg.sender, \"Only the buyer can refund funds\");\n        // 3. Escrow must be funded\n        require(e.status == Status.FUNDED, \"Escrow not funded\");\n\n        // External call: sends ETH to the buyer's address.\n        // State is updated before this call to prevent reentrancy attacks.\n\n        // Effects: Update state before interacting with external accounts\n        e.status = Status.REFUNDED;\n        uint256 amount = e.amount;\n        e.amount = 0; // Zero out the amount before sending\n        \n        // Interactions: External call last (Checks-Effects-Interactions pattern)\n        // msg.sender = buyer address\n        (bool success, ) = payable(msg.sender).call{value: amount}(\"\");\n        require(success, \"Failed to refund funds\"); // Revert the transaction if failed\n        emit FundsRefunded(_escrowId, msg.sender, amount);\n    }\n\n    function getEscrow(uint256 _escrowId) public view returns (Escrow memory) {\n        Escrow storage e = escrows[_escrowId];\n        // Few Checks:\n        // 1. Escrow must exist\n        require(e.exists, \"Escrow does not exist\");\n        \n        return escrows[_escrowId];\n    }\n}"
+      }
+    }
+  }
+}
