@@ -1,11 +1,11 @@
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
-import artifact from '../artifacts/contracts/UserRegistry.sol/UserRegistry.json';
+import artifact from '../artifacts/contracts/EscrowContract.sol/EscrowContract.json';
 
 dotenv.config();
 
 const rpcUrl = process.env.RPC_URL;
-const privateKey = process.env.PRIVATE_KEY;
+const privateKey = process.env.BUYER_PRIVATE_KEY;
 
 if (!privateKey || !rpcUrl) {
     throw new Error('PRIVATE_KEY or RPC_URL is not set');

@@ -1,179 +1,178 @@
-# User Registry (CLI + Scripts)
+# Escrow Contract
 
-This project contains a small Ethereum smart contract (`UserRegistry`) plus Node/TypeScript scripts to:
+A small Ethereum escrow smart contract plus a TypeScript CLI. The contract holds the buyer’s ETH until the deal is settled — then pays the seller or refunds the buyer — without trusting a seller or a centralized platform.
 
-- `deploy` the contract
-- `register` a user (create an entry in the contract)
-- `update` a user (update investments + PnL)
-- `read` a user (query stored values)
+```mermaid
+flowchart LR
+  deploy[Deploy] --> create[CreateEscrow]
+  create --> deposit[DepositFunds]
+  deposit --> release[ReleaseFunds]
+  deposit --> refund[RefundFunds]
+```
 
-It also includes an interactive CLI (`scripts/cli.ts`) that lets you choose between **two wallets** for write operations (`register` and `update`). The `read` action does not require a wallet.
+![Escrow contract lifecycle](docs/contract.png)
+
+## What is an escrow?
+
+An escrow is a middleman that holds the buyer’s Ethereum until the transaction conditions are met. Instead of sending money straight to the seller (or trusting a centralized marketplace), the **blockchain contract itself** controls when funds go to the seller or back to the buyer.
+
+In this project:
+
+1. Buyer creates an escrow with a seller address  
+2. Buyer deposits ETH into the contract (`EMPTY` → `FUNDED`)  
+3. Buyer either **releases** funds to the seller or **refunds** themselves  
 
 ## How the contract works
 
-The contract stores a mapping:
+Contract: [`contracts/EscrowContract.sol`](contracts/EscrowContract.sol)
 
-- `users[userId] -> { owner, userId, investments, pnl, exists }`
+Each escrow stores:
 
-### `registerUser(userId, investments, pnl)`
+| Field | Meaning |
+|-------|---------|
+| `escrowId` | Unique ID |
+| `buyer` | Creator / funder (msg.sender on create) |
+| `seller` | Payout address on release |
+| `amount` | ETH locked in the escrow |
+| `status` | `EMPTY` → `FUNDED` → `RELEASED` or `REFUNDED` |
+| `exists` | Whether this ID was created |
 
-- Reverts if `users[userId]` already exists.
-- Reverts if `userId == 0`.
-- Stores:
-  - `owner = msg.sender`
-  - `userId`
-  - `investments`
-  - `pnl`
-- Emits:
-  - `UserRegistered(owner, userId, investments, pnl)`
+### Status flow
 
-### `updateUser(userId, investments, pnl)`
+`EMPTY` → deposit → `FUNDED` → release → `RELEASED`  
+                   ↘ refund → `REFUNDED`
 
-- Reverts if the user does not exist.
-- Reverts if `msg.sender != users[userId].owner` (only the registering wallet can update).
-- Updates:
-  - `investments`
-  - `pnl`
-- Emits:
-  - `UserUpdated(owner, userId, investments, pnl)`
+### Required checks
 
-### `getUser(userId)`
+#### `createEscrow(escrowId, seller)`
 
-Read-only function returning:
+- Buyer and seller cannot be the same (`msg.sender != seller`)
+- Escrow ID must not already exist (`!escrows[id].exists`)
 
-- `owner`
-- `userId`
-- `investments`
-- `pnl`
+Creates the escrow with `amount = 0` and status `EMPTY`. Emits `EscrowCreated`.
 
-## Events (what you’ll see in the CLI/scripts)
+#### `depositFunds(escrowId)` (payable)
 
-After `register` or `update`, the scripts decode the transaction receipt logs and print the emitted event:
+- Escrow must exist
+- Only the buyer can deposit
+- `msg.value` must be greater than 0
+- Status must be `EMPTY`
 
-- `UserRegistered`
-  - `owner`
-  - `userId`
-  - `investments`
-  - `pnl`
-- `UserUpdated`
-  - `owner`
-  - `userId`
-  - `investments`
-  - `pnl`
+Sets status to `FUNDED` and stores the amount. Emits `FundsFunded`.
 
-If your transaction reverts, you won’t get these events.
+#### `releaseFunds(escrowId)`
+
+- Escrow must exist
+- Only the buyer can release
+- Status must be `FUNDED`
+
+Uses checks-effects-interactions: status → `RELEASED`, amount zeroed, then ETH sent to the seller. Emits `FundsReleased`. Reverts if the transfer fails.
+
+![Release funds](docs/releaseFunds.png)
+
+#### `refundFunds(escrowId)`
+
+- Escrow must exist
+- Only the buyer can refund
+- Status must be `FUNDED`
+
+Same CEI pattern: status → `REFUNDED`, amount zeroed, then ETH returned to the buyer. Emits `FundsRefunded`. Reverts if the transfer fails.
+
+![Refund funds](docs/refundFunds.png)
+
+#### `getEscrow(escrowId)` (view)
+
+- Escrow must exist
+
+Returns the full escrow struct.
+
+### Events
+
+| Event | When |
+|-------|------|
+| `EscrowCreated` | After create |
+| `FundsFunded` | After deposit |
+| `FundsReleased` | After release to seller |
+| `FundsRefunded` | After refund to buyer |
 
 ## Project setup
 
 1. Install dependencies:
-   ```bash
-   npm install
-   ```
+
+```bash
+npm install
+```
+
 2. Create your environment file:
-   - Copy `.env.example` to `.env`
-   - Fill in at least:
-     - `RPC_URL`
-     - `PRIVATE_KEY_1` and/or `PRIVATE_KEY_2` (for CLI write actions)
-     - `PRIVATE_KEY` (for the manual scripts; CLI may also fall back to this for wallet 1)
-
-> Note: The CLI can also prompt for missing values and write them into `.env` automatically.
-
-## Environment variables
-
-Expected variables in `.env`:
-
-- `RPC_URL`: JSON-RPC URL for your chain (e.g. `http://127.0.0.1:8545`)
-- `PRIVATE_KEY`: signer key used by the manual scripts (wallet selection is not used there)
-- `PRIVATE_KEY_1`: private key for wallet selection `1`
-- `PRIVATE_KEY_2`: private key for wallet selection `2`
-- `CONTRACT_ADDRESS`: the deployed `UserRegistry` address
-
-## Manual script usage
-
-You can run the scripts directly (without the interactive CLI).
-
-### Deploy
 
 ```bash
-npx tsx scripts/deploy.ts
+cp .env.example .env
 ```
 
-The script will deploy and print the deployed contract address.
-Copy that value into `CONTRACT_ADDRESS` in `.env` before running `register/update/read`.
+3. Fill in `.env`:
 
-### Register user
+| Variable | Purpose |
+|----------|---------|
+| `RPC_URL` | JSON-RPC endpoint (e.g. `http://127.0.0.1:8545`) |
+| `BUYER_PRIVATE_KEY` | Buyer — deploy, create, deposit, release, refund |
+| `SELLER_PRIVATE_KEY` | Seller address used on create / release |
+| `CONTRACT_ADDRESS` | Set automatically by CLI deploy |
+
+For local Hardhat, the default accounts work as buyer/seller keys.
+
+4. Compile (if needed):
 
 ```bash
-npx tsx scripts/registerUser.ts
+npx hardhat compile
 ```
 
-### Update user
+5. Start a local node (separate terminal) if using Hardhat:
 
 ```bash
-npx tsx scripts/updateUser.ts
-```
-
-### Read user
-
-```bash
-npx tsx scripts/readUser.ts
+npx hardhat node
 ```
 
 ## CLI usage (recommended)
 
-### Interactive mode
+Everything runs through the CLI:
 
 ```bash
 npm run cli
 ```
 
-You will see a menu:
+On launch you see **buyer private key**, **seller private key**, and **contract address** (keys masked). Menu:
 
-- Deploy
-- Register user
-- Update user
-- Read user
+1. **Deploy contract** — deploys and writes `CONTRACT_ADDRESS` into `.env`  
+2. **Create escrow** — prompts for escrow ID; seller is fetched from `SELLER_PRIVATE_KEY` in `.env`  
+3. **Escrow transactions** — submenu: Deposit / Release / Refund  
+4. **Read escrow** — prints ID, parties, amount, status, exists, and balances  
+5. **Exit**
 
-For `register` and `update`, the CLI will ask you to choose **wallet 1 or wallet 2**. The transaction sender is the selected wallet.
+### Non-interactive commands
 
-For `read`, it uses only `RPC_URL` + `CONTRACT_ADDRESS`.
-
-### Non-interactive mode (CLI reference)
-
-Read:
 ```bash
-npm run cli -- read --userId 2
+npm run cli -- deploy
+npm run cli -- create --escrowId 1
+npm run cli -- deposit --escrowId 1 --amount 1
+npm run cli -- release --escrowId 1
+npm run cli -- refund --escrowId 1
+npm run cli -- read --escrowId 1
 ```
 
-Deploy:
+### Missing config
+
+- Missing `CONTRACT_ADDRESS` → CLI offers to deploy and updates `.env`
+- Missing `RPC_URL` / keys → CLI prompts and can write them into `.env`
+
+## Manual scripts (optional)
+
+One-off scripts (same env vars):
+
 ```bash
-npm run cli -- deploy --wallet 1
+npx tsx scripts/deploy.ts
+npx tsx scripts/createEscrow.ts
+npx tsx scripts/escrowTransation.ts deposit   # or: release | refund
+npx tsx scripts/readEscrow.ts
 ```
 
-Register:
-```bash
-npm run cli -- register --wallet 1 --userId 2 --investments 5000 --pnl 700
-```
-
-Update:
-```bash
-npm run cli -- update --wallet 1 --userId 2 --investments 5000 --pnl 9000
-```
-
-### Missing configuration behavior
-
-- `CONTRACT_ADDRESS`
-  - If missing, the CLI will ask whether to deploy now.
-  - After a successful deploy, it writes `CONTRACT_ADDRESS` into `.env`.
-- `RPC_URL` / `PRIVATE_KEY_1` / `PRIVATE_KEY_2`
-  - If missing, the CLI will prompt you and then write the values into `.env`.
-
-## Important note about “two wallets”
-
-Because `updateUser` requires `msg.sender == users[userId].owner`, you must:
-
-- Register using wallet `1` (if `PRIVATE_KEY_1` is selected)
-- Update using the same wallet that originally registered that `userId`
-
-If you try to update from the other wallet, the transaction will revert with `You are not the owner of this user`.
-
+Note: those scripts use hardcoded escrow ID `1` and deposit `1` ETH; prefer the CLI for dynamic values.

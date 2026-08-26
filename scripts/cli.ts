@@ -6,15 +6,13 @@ import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 
 const artifact = JSON.parse(
-  fs.readFileSync(path.resolve(process.cwd(), 'artifacts/contracts/UserRegistry.sol/UserRegistry.json'), 'utf8')
+  fs.readFileSync(
+    path.resolve(process.cwd(), 'artifacts/contracts/EscrowContract.sol/EscrowContract.json'),
+    'utf8'
+  )
 );
 
-type WalletIndex = 1 | 2;
-type LastWriteInput = {
-  userId?: string;
-  investments?: string;
-  pnl?: string;
-};
+const STATUS = ['EMPTY', 'FUNDED', 'RELEASED', 'REFUNDED'] as const;
 
 const ENV_PATH = path.resolve(process.cwd(), '.env');
 const IS_TTY = Boolean(process.stdout.isTTY);
@@ -26,10 +24,12 @@ const COLOR = {
   yellow: '\x1b[33m',
   red: '\x1b[31m',
   gray: '\x1b[90m',
+  magenta: '\x1b[35m',
   bold: '\x1b[1m',
 };
 
-const lastWriteInput: LastWriteInput = {};
+let lastEscrowId: string | undefined;
+let lastAmount: string | undefined;
 
 function paint(text: string, color: keyof typeof COLOR) {
   if (!IS_TTY) return text;
@@ -43,7 +43,7 @@ function paintBold(text: string) {
 
 function maskSecret(secret?: string) {
   const v = secret?.trim();
-  if (!v) return 'missing';
+  if (!v) return paint('(missing)', 'red');
   if (v.length <= 12) return `${v.slice(0, 2)}...${v.slice(-2)}`;
   return `${v.slice(0, 6)}...${v.slice(-4)}`;
 }
@@ -51,38 +51,45 @@ function maskSecret(secret?: string) {
 function printBanner() {
   console.log('');
   console.log(paint('======================================', 'cyan'));
-  console.log(paintBold('   User Registry CLI'));
+  console.log(paintBold('   Escrow Contract CLI'));
   console.log(paint('======================================', 'cyan'));
 }
 
 function printConfigSummary() {
   const rpcUrl = process.env.RPC_URL?.trim();
   const contractAddress = process.env.CONTRACT_ADDRESS?.trim();
-
-  const privateKey1 = process.env.PRIVATE_KEY_1?.trim();
-  const privateKey2 = process.env.PRIVATE_KEY_2?.trim();
-  const privateKey = process.env.PRIVATE_KEY?.trim();
+  const buyerKey = process.env.BUYER_PRIVATE_KEY?.trim();
+  const sellerKey = process.env.SELLER_PRIVATE_KEY?.trim();
 
   console.log('');
   console.log(paintBold('Configuration'));
   console.log(paint('--------------------------------------', 'gray'));
-  console.log(`${paint('Env file:', 'gray')} ${ENV_PATH}`);
-  console.log(`${paint('RPC_URL:', 'gray')} ${rpcUrl || '(missing)'}`);
-  console.log(`${paint('CONTRACT_ADDRESS:', 'gray')} ${contractAddress || '(missing)'}`);
-  console.log(`${paint('PRIVATE_KEY (manual/scripts wallet):', 'gray')} ${maskSecret(privateKey)}`);
-  console.log(`${paint('PRIVATE_KEY_1 (wallet 1):', 'gray')} ${maskSecret(privateKey1)}`);
-  console.log(`${paint('PRIVATE_KEY_2 (wallet 2):', 'gray')} ${maskSecret(privateKey2)}`);
+  console.log(`${paint('Buyer PK:', 'gray')}  ${maskSecret(buyerKey)}`);
+  console.log(`${paint('Seller PK:', 'gray')} ${maskSecret(sellerKey)}`);
+  console.log(
+    `${paint('Contract:', 'gray')}  ${contractAddress && isProbablyAddress(contractAddress) ? contractAddress : paint('(missing)', 'red')}`
+  );
+  console.log(`${paint('RPC_URL:', 'gray')}   ${rpcUrl || paint('(missing)', 'red')}`);
   console.log(paint('--------------------------------------', 'gray'));
 }
 
 function printMenu() {
   console.log('');
   console.log(paintBold('Choose an option:'));
-  console.log('1) Deploy');
-  console.log('2) Register user');
-  console.log('3) Update user');
-  console.log('4) Read user');
-  console.log('5) Exit');
+  console.log(`  ${paint('1)', 'cyan')} Deploy contract`);
+  console.log(`  ${paint('2)', 'cyan')} Create escrow`);
+  console.log(`  ${paint('3)', 'cyan')} Escrow transactions`);
+  console.log(`  ${paint('4)', 'cyan')} Read escrow`);
+  console.log(`  ${paint('5)', 'cyan')} Exit`);
+}
+
+function printTxMenu() {
+  console.log('');
+  console.log(paintBold('Escrow transactions:'));
+  console.log(`  ${paint('1)', 'cyan')} Deposit funds`);
+  console.log(`  ${paint('2)', 'cyan')} Release funds`);
+  console.log(`  ${paint('3)', 'cyan')} Refund funds`);
+  console.log(`  ${paint('4)', 'cyan')} Back`);
 }
 
 function getErrorReason(error: unknown) {
@@ -99,7 +106,6 @@ function getErrorReason(error: unknown) {
 
   if (!raw) return 'Unknown error';
 
-  // Keep output short and human-readable.
   const firstLine = String(raw).split('\n')[0].trim();
   const lowered = firstLine.toLowerCase();
 
@@ -115,8 +121,6 @@ function getErrorReason(error: unknown) {
 }
 
 function createProvider(rpcUrl: string) {
-  // staticNetwork avoids repeated network-detection retries and noisy logs
-  // when the RPC endpoint is invalid/unauthorized.
   return new ethers.JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
 }
 
@@ -130,7 +134,6 @@ function validateRpcUrl(rpcUrl: string) {
 
   if (parsed.hostname === 'rpc.ankr.com') {
     const segments = parsed.pathname.split('/').filter(Boolean);
-    // Typical keyed format: /eth_sepolia/<apiKey>
     if (segments.length < 2) {
       throw new Error('RPC unauthorized: add your Ankr API key to RPC_URL.');
     }
@@ -146,7 +149,6 @@ function isProbablyAddress(value: string) {
 }
 
 function formatEnvValue(key: string, value: string) {
-  // Private keys tend to be hex strings; quoting avoids accidental parsing issues.
   const shouldQuote =
     key.toLowerCase().includes('private_key') ||
     value.trim().length === 0 ||
@@ -165,7 +167,6 @@ function upsertEnvVar(key: string, value: string) {
   const existing = fs.readFileSync(ENV_PATH, 'utf8');
   const escapedKey = escapeRegExp(key);
   const lineRegex = new RegExp(`^${escapedKey}=.*$`, 'm');
-
   const formatted = formatEnvValue(key, value);
 
   let next: string;
@@ -177,7 +178,6 @@ function upsertEnvVar(key: string, value: string) {
   }
 
   fs.writeFileSync(ENV_PATH, next, 'utf8');
-  // Keep process.env in sync for the rest of this run.
   process.env[key] = value;
 }
 
@@ -204,7 +204,7 @@ async function askNonEmpty(rl: ReturnType<typeof createInterface>, question: str
   while (true) {
     const ans = (await rl.question(question)).trim();
     if (ans.length > 0) return ans;
-    console.log('Please enter a value.');
+    console.log(paint('Please enter a value.', 'yellow'));
   }
 }
 
@@ -218,14 +218,6 @@ async function askWithDefault(
   if (raw.length > 0) return raw;
   if (previous) return previous;
   return askNonEmpty(rl, `${label}: `);
-}
-
-async function selectWallet(rl: ReturnType<typeof createInterface>) {
-  while (true) {
-    const ans = (await rl.question('Select wallet for write actions (`1` or `2`): ')).trim();
-    if (ans === '1' || ans === '2') return Number(ans) as WalletIndex;
-    console.log('Invalid selection. Choose `1` or `2`.');
-  }
 }
 
 async function ensureRpcUrl(rl?: ReturnType<typeof createInterface>) {
@@ -243,19 +235,44 @@ async function ensureRpcUrl(rl?: ReturnType<typeof createInterface>) {
   return nextRpcUrl;
 }
 
+async function ensureBuyerPrivateKey(rl?: ReturnType<typeof createInterface>) {
+  const existing = process.env.BUYER_PRIVATE_KEY?.trim();
+  if (existing) return existing;
+
+  if (!rl) {
+    throw new Error('BUYER_PRIVATE_KEY is missing. Set BUYER_PRIVATE_KEY in .env.');
+  }
+
+  const next = await askNonEmpty(rl, 'Enter BUYER_PRIVATE_KEY: ');
+  upsertEnvVar('BUYER_PRIVATE_KEY', next);
+  return next;
+}
+
+async function ensureSellerPrivateKey(rl?: ReturnType<typeof createInterface>) {
+  const existing = process.env.SELLER_PRIVATE_KEY?.trim();
+  if (existing) return existing;
+
+  if (!rl) {
+    throw new Error('SELLER_PRIVATE_KEY is missing. Set SELLER_PRIVATE_KEY in .env.');
+  }
+
+  const next = await askNonEmpty(rl, 'Enter SELLER_PRIVATE_KEY: ');
+  upsertEnvVar('SELLER_PRIVATE_KEY', next);
+  return next;
+}
+
 async function ensureContractAddress(rl?: ReturnType<typeof createInterface>) {
   const contractAddress = process.env.CONTRACT_ADDRESS?.trim();
   if (contractAddress && isProbablyAddress(contractAddress)) return contractAddress;
 
   if (!rl) throw new Error('CONTRACT_ADDRESS is not set. Deploy first or set CONTRACT_ADDRESS in .env.');
 
-  const answer = (await rl.question(
-    'CONTRACT_ADDRESS is missing. Deploy now? (y/N): '
-  )).trim().toLowerCase();
+  const answer = (await rl.question('CONTRACT_ADDRESS is missing. Deploy now? (y/N): '))
+    .trim()
+    .toLowerCase();
 
   if (answer === 'y' || answer === 'yes') {
-    const walletIndex = await selectWallet(rl);
-    await deployFlow(rl, walletIndex);
+    await deployFlow(rl);
     const deployed = process.env.CONTRACT_ADDRESS?.trim();
     if (!deployed || !isProbablyAddress(deployed)) {
       throw new Error('Deployment finished, but CONTRACT_ADDRESS was not set correctly.');
@@ -266,183 +283,262 @@ async function ensureContractAddress(rl?: ReturnType<typeof createInterface>) {
   throw new Error('Cannot continue without CONTRACT_ADDRESS.');
 }
 
-function getPrivateKeyForWallet(walletIndex: WalletIndex) {
-  const direct = process.env[`PRIVATE_KEY_${walletIndex}`]?.trim();
-  if (direct) return direct;
-
-  // Backwards compatibility: if you only have one `PRIVATE_KEY` in .env, assume it is wallet 1.
-  if (walletIndex === 1 && process.env.PRIVATE_KEY?.trim()) return process.env.PRIVATE_KEY.trim();
-
-  return undefined;
-}
-
-async function ensurePrivateKey(walletIndex: WalletIndex, rl?: ReturnType<typeof createInterface>) {
-  const existing = getPrivateKeyForWallet(walletIndex);
-  if (existing) return existing;
-
-  if (!rl) {
-    throw new Error(
-      `Private key for wallet ${walletIndex} is missing. Set PRIVATE_KEY_${walletIndex} in .env.`
-    );
-  }
-
-  const answerKey = `PRIVATE_KEY_${walletIndex}`;
-  const next = await askNonEmpty(
-    rl,
-    `Enter private key for wallet ${walletIndex} (${answerKey}): `
-  );
-  upsertEnvVar(answerKey, next);
-  return next;
-}
-
-async function decodeReceiptEvents(contract: ethers.Contract, receipt: ethers.TransactionReceipt) {
-  console.log('');
-  console.log(paintBold('Event Logs'));
-  for (const log of receipt.logs) {
-    try {
-      const parsed = contract.interface.parseLog(log);
-      if (parsed?.name === 'UserRegistered') {
-        console.log('Event: UserRegistered');
-        console.log(`  Owner: ${parsed.args.owner}`);
-        console.log(`  UserId: ${parsed.args.userId}`);
-        console.log(`  Investments: ${parsed.args.investments}`);
-        console.log(`  PnL: ${parsed.args.pnl}`);
-      } else if (parsed?.name === 'UserUpdated') {
-        console.log('Event: UserUpdated');
-        console.log(`  Owner: ${parsed.args.owner}`);
-        console.log(`  UserId: ${parsed.args.userId}`);
-        console.log(`  Investments: ${parsed.args.investments}`);
-        console.log(`  PnL: ${parsed.args.pnl}`);
-      }
-    } catch {
-      // Not one of the contract's events; ignore.
-    }
-  }
-}
-
-async function deployFlow(rl: ReturnType<typeof createInterface> | undefined, walletIndex: WalletIndex) {
+async function getBuyerContract(rl?: ReturnType<typeof createInterface>) {
+  const contractAddress = await ensureContractAddress(rl);
   const rpcUrl = await ensureRpcUrl(rl);
-  const privateKey = await ensurePrivateKey(walletIndex, rl);
+  const privateKey = await ensureBuyerPrivateKey(rl);
 
   const provider = createProvider(rpcUrl);
   const wallet = new ethers.Wallet(privateKey, provider);
+  const contract = new ethers.Contract(contractAddress, artifact.abi, wallet);
 
+  return { provider, wallet, contract, contractAddress };
+}
+
+async function deployFlow(rl?: ReturnType<typeof createInterface>) {
+  const rpcUrl = await ensureRpcUrl(rl);
+  const privateKey = await ensureBuyerPrivateKey(rl);
+
+  const provider = createProvider(rpcUrl);
+  const wallet = new ethers.Wallet(privateKey, provider);
   const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, wallet);
 
   console.log('');
-  console.log(paint(`Deploying from wallet ${walletIndex}: ${wallet.address} ...`, 'yellow'));
+  console.log(paint(`Deploying from buyer: ${wallet.address} ...`, 'yellow'));
   const contractTx = await factory.deploy();
   await contractTx.waitForDeployment();
 
   const contractAddress = await contractTx.getAddress();
   console.log('');
-  console.log(paint('Deployment Success', 'green'));
-  console.log(`Contract: ${contractAddress}`);
+  console.log(paint('------------------- Deployment Success -------------------', 'green'));
+  console.log(`${paint('Deployer:', 'gray')} ${wallet.address}`);
+  console.log(`${paint('Contract:', 'gray')} ${contractAddress}`);
 
   upsertEnvVar('CONTRACT_ADDRESS', contractAddress);
+  console.log(paint('CONTRACT_ADDRESS updated in .env', 'green'));
 }
 
-async function registerFlow(
-  rl: ReturnType<typeof createInterface> | undefined,
-  walletIndex: WalletIndex,
-  input?: {
-  userId: string;
-  investments: string;
-  pnl: string;
-}
+async function createEscrowFlow(
+  rl?: ReturnType<typeof createInterface>,
+  input?: { escrowId: string }
 ) {
-  const contractAddress = await ensureContractAddress(rl);
-  const rpcUrl = await ensureRpcUrl(rl);
-  const privateKey = await ensurePrivateKey(walletIndex, rl);
+  const { wallet, contract } = await getBuyerContract(rl);
+  const sellerKey = await ensureSellerPrivateKey(rl);
+  const sellerWallet = new ethers.Wallet(sellerKey);
 
-  const provider = createProvider(rpcUrl);
-  const wallet = new ethers.Wallet(privateKey, provider);
-  const contract = new ethers.Contract(contractAddress, artifact.abi, wallet);
-
-  const userIdStr =
-    input?.userId ?? (await askWithDefault(rl!, 'User ID (uint256)', lastWriteInput.userId));
-  const investmentsStr =
-    input?.investments ??
-    (await askWithDefault(rl!, 'Investments (uint256)', lastWriteInput.investments));
-  const pnlStr =
-    input?.pnl ?? (await askWithDefault(rl!, 'PnL (int256, can be negative)', lastWriteInput.pnl));
-
-  const userId = parseBigInt('User ID', userIdStr);
-  const investments = parseBigInt('Investments', investmentsStr);
-  const pnl = parseBigInt('PnL', pnlStr);
+  const escrowIdStr =
+    input?.escrowId ?? (await askWithDefault(rl!, 'Escrow ID (uint256)', lastEscrowId));
+  const escrowId = parseBigInt('Escrow ID', escrowIdStr);
 
   console.log('');
-  console.log(paint(`Registering userId=${userId.toString()} from wallet ${walletIndex} ...`, 'yellow'));
-  const tx = await contract.registerUser(userId, investments, pnl);
+  console.log(
+    paint(`Fetched seller address from .env: ${sellerWallet.address}`, 'green')
+  );
+
   console.log('');
-  console.log(paint('Transaction Submitted', 'green'));
-  console.log(`Hash: ${tx.hash}`);
+  console.log(
+    paint(`Creating escrowId=${escrowId.toString()} from buyer ${wallet.address} ...`, 'yellow')
+  );
+
+  const tx = await contract.createEscrow(escrowId, sellerWallet.address);
+  const receipt = await tx.wait();
+
+  console.log('');
+  console.log(paint('------------------- Escrow Created -------------------', 'green'));
+  console.log(`${paint('Buyer:', 'gray')}            ${wallet.address}`);
+  console.log(`${paint('Seller:', 'gray')}           ${sellerWallet.address}`);
+  console.log(`${paint('Transaction Hash:', 'gray')} ${tx.hash}`);
+  console.log(`${paint('Block Number:', 'gray')}     ${receipt?.blockNumber}`);
+  console.log(`${paint('Gas Used:', 'gray')}         ${receipt?.gasUsed?.toString()}`);
+
+  lastEscrowId = escrowIdStr;
+
+  for (const log of receipt?.logs ?? []) {
+    try {
+      const parsed = contract.interface.parseLog(log);
+      if (parsed?.name === 'EscrowCreated') {
+        console.log('');
+        console.log(paintBold('Event: EscrowCreated'));
+        console.log(`  Escrow ID: ${parsed.args.escrowId.toString()}`);
+        console.log(`  Buyer:     ${parsed.args.buyer}`);
+        console.log(`  Seller:    ${parsed.args.seller}`);
+      }
+    } catch {
+      // ignore non-matching logs
+    }
+  }
+}
+
+async function depositFlow(
+  rl?: ReturnType<typeof createInterface>,
+  input?: { escrowId: string; amount: string }
+) {
+  const { provider, wallet, contract } = await getBuyerContract(rl);
+  const sellerKey = await ensureSellerPrivateKey(rl);
+  const sellerWallet = new ethers.Wallet(sellerKey);
+
+  const escrowIdStr =
+    input?.escrowId ?? (await askWithDefault(rl!, 'Escrow ID (uint256)', lastEscrowId));
+  const amountStr =
+    input?.amount ?? (await askWithDefault(rl!, 'Amount (ETH)', lastAmount ?? '1'));
+
+  const escrowId = parseBigInt('Escrow ID', escrowIdStr);
+  let value: bigint;
+  try {
+    value = ethers.parseEther(amountStr);
+  } catch {
+    throw new Error(`Amount must be a valid ETH value. Got: ${amountStr}`);
+  }
+  if (value <= 0n) throw new Error('Amount must be greater than 0');
+
+  console.log('');
+  console.log(
+    paint(
+      `Depositing ${amountStr} ETH into escrowId=${escrowId.toString()} ...`,
+      'yellow'
+    )
+  );
+
+  const tx = await contract.depositFunds(escrowId, { value });
+  console.log(`${paint('Transaction hash:', 'gray')} ${tx.hash}`);
 
   const receipt = await tx.wait();
+
   console.log('');
-  console.log(paintBold('Transaction Receipt'));
-  console.log(`Block number: ${receipt.blockNumber}`);
-  console.log(`Gas used: ${receipt.gasUsed}`);
+  console.log(paint('------------------- Funds Deposited -------------------', 'green'));
+  console.log(`${paint('Buyer:', 'gray')}        ${wallet.address}`);
+  console.log(`${paint('Seller:', 'gray')}       ${sellerWallet.address}`);
+  console.log(`${paint('Block Number:', 'gray')} ${receipt?.blockNumber}`);
+  console.log(`${paint('Gas Used:', 'gray')}     ${receipt?.gasUsed?.toString()}`);
 
-  lastWriteInput.userId = userIdStr;
-  lastWriteInput.investments = investmentsStr;
-  lastWriteInput.pnl = pnlStr;
+  for (const log of receipt?.logs ?? []) {
+    try {
+      const parsed = contract.interface.parseLog(log);
+      if (parsed?.name === 'FundsFunded') {
+        console.log(`${paint('Escrow ID:', 'gray')}    ${parsed.args.escrowId.toString()}`);
+        console.log(
+          `${paint('Amount:', 'gray')}       ${ethers.formatEther(parsed.args.amount)} ETH`
+        );
+      }
+    } catch {
+      // ignore
+    }
+  }
 
-  await decodeReceiptEvents(contract, receipt);
+  const buyerBalance = await provider.getBalance(wallet.address);
+  console.log(
+    `${paint('Buyer Wallet Balance:', 'gray')} ${ethers.formatEther(buyerBalance)} ETH`
+  );
+
+  lastEscrowId = escrowIdStr;
+  lastAmount = amountStr;
 }
 
-async function updateFlow(
-  rl: ReturnType<typeof createInterface> | undefined,
-  walletIndex: WalletIndex,
-  input?: {
-  userId: string;
-  investments: string;
-  pnl: string;
-}
+async function releaseFlow(
+  rl?: ReturnType<typeof createInterface>,
+  input?: { escrowId: string }
 ) {
-  const contractAddress = await ensureContractAddress(rl);
-  const rpcUrl = await ensureRpcUrl(rl);
-  const privateKey = await ensurePrivateKey(walletIndex, rl);
+  const { provider, wallet, contract } = await getBuyerContract(rl);
+  const sellerKey = await ensureSellerPrivateKey(rl);
+  const sellerWallet = new ethers.Wallet(sellerKey);
 
-  const provider = createProvider(rpcUrl);
-  const wallet = new ethers.Wallet(privateKey, provider);
-  const contract = new ethers.Contract(contractAddress, artifact.abi, wallet);
-
-  const userIdStr =
-    input?.userId ?? (await askWithDefault(rl!, 'User ID (uint256)', lastWriteInput.userId));
-  const investmentsStr =
-    input?.investments ??
-    (await askWithDefault(rl!, 'Investments (uint256)', lastWriteInput.investments));
-  const pnlStr =
-    input?.pnl ?? (await askWithDefault(rl!, 'PnL (int256, can be negative)', lastWriteInput.pnl));
-
-  const userId = parseBigInt('User ID', userIdStr);
-  const investments = parseBigInt('Investments', investmentsStr);
-  const pnl = parseBigInt('PnL', pnlStr);
+  const escrowIdStr =
+    input?.escrowId ?? (await askWithDefault(rl!, 'Escrow ID (uint256)', lastEscrowId));
+  const escrowId = parseBigInt('Escrow ID', escrowIdStr);
 
   console.log('');
-  console.log(paint(`Updating userId=${userId.toString()} from wallet ${walletIndex} ...`, 'yellow'));
-  const tx = await contract.updateUser(userId, investments, pnl);
-  console.log('');
-  console.log(paint('Transaction Submitted', 'green'));
-  console.log(`Hash: ${tx.hash}`);
+  console.log(
+    paint(`Releasing funds for escrowId=${escrowId.toString()} ...`, 'yellow')
+  );
+
+  const tx = await contract.releaseFunds(escrowId);
+  console.log(`${paint('Transaction hash:', 'gray')} ${tx.hash}`);
 
   const receipt = await tx.wait();
+
   console.log('');
-  console.log(paintBold('Transaction Receipt'));
-  console.log(`Block number: ${receipt.blockNumber}`);
-  console.log(`Gas used: ${receipt.gasUsed}`);
+  console.log(paint('------------------- Funds Released -------------------', 'green'));
+  console.log(`${paint('Buyer:', 'gray')}        ${wallet.address}`);
+  console.log(`${paint('Seller:', 'gray')}       ${sellerWallet.address}`);
+  console.log(`${paint('Block Number:', 'gray')} ${receipt?.blockNumber}`);
+  console.log(`${paint('Gas Used:', 'gray')}     ${receipt?.gasUsed?.toString()}`);
 
-  lastWriteInput.userId = userIdStr;
-  lastWriteInput.investments = investmentsStr;
-  lastWriteInput.pnl = pnlStr;
+  for (const log of receipt?.logs ?? []) {
+    try {
+      const parsed = contract.interface.parseLog(log);
+      if (parsed?.name === 'FundsReleased') {
+        console.log(`${paint('Escrow ID:', 'gray')}    ${parsed.args.escrowId.toString()}`);
+        console.log(
+          `${paint('Amount:', 'gray')}       ${ethers.formatEther(parsed.args.amount)} ETH`
+        );
+      }
+    } catch {
+      // ignore
+    }
+  }
 
-  await decodeReceiptEvents(contract, receipt);
+  const sellerBalance = await provider.getBalance(sellerWallet.address);
+  console.log(
+    `${paint('Seller Wallet Balance:', 'gray')} ${ethers.formatEther(sellerBalance)} ETH`
+  );
+
+  lastEscrowId = escrowIdStr;
+}
+
+async function refundFlow(
+  rl?: ReturnType<typeof createInterface>,
+  input?: { escrowId: string }
+) {
+  const { provider, wallet, contract } = await getBuyerContract(rl);
+  const sellerKey = await ensureSellerPrivateKey(rl);
+  const sellerWallet = new ethers.Wallet(sellerKey);
+
+  const escrowIdStr =
+    input?.escrowId ?? (await askWithDefault(rl!, 'Escrow ID (uint256)', lastEscrowId));
+  const escrowId = parseBigInt('Escrow ID', escrowIdStr);
+
+  console.log('');
+  console.log(
+    paint(`Refunding funds for escrowId=${escrowId.toString()} ...`, 'yellow')
+  );
+
+  const tx = await contract.refundFunds(escrowId);
+  console.log(`${paint('Transaction hash:', 'gray')} ${tx.hash}`);
+
+  const receipt = await tx.wait();
+
+  console.log('');
+  console.log(paint('------------------- Funds Refunded -------------------', 'green'));
+  console.log(`${paint('Buyer:', 'gray')}        ${wallet.address}`);
+  console.log(`${paint('Seller:', 'gray')}       ${sellerWallet.address}`);
+  console.log(`${paint('Block Number:', 'gray')} ${receipt?.blockNumber}`);
+  console.log(`${paint('Gas Used:', 'gray')}     ${receipt?.gasUsed?.toString()}`);
+
+  for (const log of receipt?.logs ?? []) {
+    try {
+      const parsed = contract.interface.parseLog(log);
+      if (parsed?.name === 'FundsRefunded') {
+        console.log(`${paint('Escrow ID:', 'gray')}    ${parsed.args.escrowId.toString()}`);
+        console.log(
+          `${paint('Amount:', 'gray')}       ${ethers.formatEther(parsed.args.amount)} ETH`
+        );
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const buyerBalance = await provider.getBalance(wallet.address);
+  console.log(
+    `${paint('Buyer Wallet Balance:', 'gray')} ${ethers.formatEther(buyerBalance)} ETH`
+  );
+
+  lastEscrowId = escrowIdStr;
 }
 
 async function readFlow(
-  rl: ReturnType<typeof createInterface> | undefined,
-  input?: { userId: string }
+  rl?: ReturnType<typeof createInterface>,
+  input?: { escrowId: string }
 ) {
   const contractAddress = await ensureContractAddress(rl);
   const rpcUrl = await ensureRpcUrl(rl);
@@ -450,25 +546,67 @@ async function readFlow(
   const provider = createProvider(rpcUrl);
   const contract = new ethers.Contract(contractAddress, artifact.abi, provider);
 
-  const userIdStr = input?.userId ?? (await askNonEmpty(rl!, 'User ID (uint256): '));
-  const userId = parseBigInt('User ID', userIdStr);
+  const escrowIdStr =
+    input?.escrowId ?? (await askWithDefault(rl!, 'Escrow ID (uint256)', lastEscrowId));
+  const escrowId = parseBigInt('Escrow ID', escrowIdStr);
 
   console.log('');
-  console.log(paint(`Reading userId=${userId.toString()} ...`, 'yellow'));
-  const [owner, returnedUserId, investments, pnl] = await contract.getUser(userId);
+  console.log(paint(`Reading escrowId=${escrowId.toString()} ...`, 'yellow'));
+
+  const escrow = await contract.getEscrow(escrowId);
 
   console.log('');
-  console.log(paintBold('User Snapshot'));
-  console.log(`Owner: ${owner}`);
-  console.log(`User ID: ${returnedUserId.toString()}`);
-  console.log(`Investments: ${investments.toString()}`);
-  console.log(`PnL: ${pnl.toString()}`);
+  console.log(paint('------------------- Escrow Details -------------------', 'green'));
+  console.log(`${paint('Escrow ID:', 'gray')} ${escrow.escrowId.toString()}`);
+  console.log(`${paint('Buyer:', 'gray')}     ${escrow.buyer}`);
+  console.log(`${paint('Seller:', 'gray')}    ${escrow.seller}`);
+  console.log(`${paint('Amount:', 'gray')}    ${ethers.formatEther(escrow.amount)} ETH`);
+  console.log(
+    `${paint('Status:', 'gray')}    ${STATUS[Number(escrow.status)] ?? escrow.status.toString()}`
+  );
+  console.log(`${paint('Exists:', 'gray')}    ${escrow.exists}`);
+
+  console.log('');
+  console.log(paint('------------------- Balance -------------------', 'magenta'));
+  console.log(
+    `${paint('Buyer Balance:', 'gray')}  ${ethers.formatEther(await provider.getBalance(escrow.buyer))} ETH`
+  );
+  console.log(
+    `${paint('Seller Balance:', 'gray')} ${ethers.formatEther(await provider.getBalance(escrow.seller))} ETH`
+  );
+
+  lastEscrowId = escrowIdStr;
+}
+
+async function escrowTransactionsMenu(rl: ReturnType<typeof createInterface>) {
+  while (true) {
+    printTxMenu();
+    const choice = (await rl.question('Choose an option (1-4): ')).trim();
+    try {
+      if (choice === '1') {
+        await depositFlow(rl);
+      } else if (choice === '2') {
+        await releaseFlow(rl);
+      } else if (choice === '3') {
+        await refundFlow(rl);
+      } else if (choice === '4') {
+        return;
+      } else {
+        console.log(paint('Invalid choice. Please select 1-4.', 'yellow'));
+      }
+    } catch (error) {
+      console.log('');
+      console.log(paint(`Error: ${getErrorReason(error)}`, 'red'));
+    }
+  }
 }
 
 async function interactiveMenu() {
   dotenv.config({ path: ENV_PATH });
   const canPrompt = Boolean(process.stdin.isTTY);
-  if (!canPrompt) throw new Error('No TTY detected. Please run `npm run cli -- <command>` or set up .env.');
+  if (!canPrompt) {
+    throw new Error('No TTY detected. Please run `npm run cli -- <command>` or set up .env.');
+  }
 
   printBanner();
   printConfigSummary();
@@ -481,20 +619,20 @@ async function interactiveMenu() {
       const choice = (await rl.question('Choose an option (1-5): ')).trim();
       try {
         if (choice === '1') {
-          const walletIndex = await selectWallet(rl);
-          await deployFlow(rl, walletIndex);
+          await deployFlow(rl);
+          printConfigSummary();
         } else if (choice === '2') {
-          const walletIndex = await selectWallet(rl);
-          await registerFlow(rl, walletIndex);
+          await createEscrowFlow(rl);
         } else if (choice === '3') {
-          const walletIndex = await selectWallet(rl);
-          await updateFlow(rl, walletIndex);
+          await escrowTransactionsMenu(rl);
         } else if (choice === '4') {
           await readFlow(rl);
         } else if (choice === '5') {
+          console.log('');
+          console.log(paint('Goodbye!', 'cyan'));
           break;
         } else {
-          console.log('Invalid choice. Please select 1-5.');
+          console.log(paint('Invalid choice. Please select 1-5.', 'yellow'));
         }
       } catch (error) {
         console.log('');
@@ -506,6 +644,19 @@ async function interactiveMenu() {
   }
 }
 
+function printUsage() {
+  console.log('');
+  console.log(paintBold('Usage:'));
+  console.log('  npm run cli -- deploy');
+  console.log('  npm run cli -- create --escrowId <id>');
+  console.log('  npm run cli -- deposit --escrowId <id> --amount <eth>');
+  console.log('  npm run cli -- release --escrowId <id>');
+  console.log('  npm run cli -- refund --escrowId <id>');
+  console.log('  npm run cli -- read --escrowId <id>');
+  console.log('');
+  console.log('Or run `npm run cli` for the interactive menu.');
+}
+
 async function runFromArgs() {
   dotenv.config({ path: ENV_PATH });
   const argv = process.argv.slice(2);
@@ -515,51 +666,47 @@ async function runFromArgs() {
   const rl = cmd && canPrompt ? createInterface({ input, output }) : undefined;
 
   try {
-    const userId = getArgValue(argv, 'userId');
-    const investments = getArgValue(argv, 'investments');
-    const pnl = getArgValue(argv, 'pnl');
+    const escrowId = getArgValue(argv, 'escrowId');
+    const amount = getArgValue(argv, 'amount');
 
     if (cmd === 'deploy') {
-      const walletIndexRaw = getArgValue(argv, 'wallet');
-      const walletIndex = (walletIndexRaw === '2' ? 2 : 1) as WalletIndex;
-      await deployFlow(rl, walletIndex);
+      await deployFlow(rl);
       return;
     }
 
-    if (cmd === 'register') {
-      const walletIndexRaw = getArgValue(argv, 'wallet');
-      const walletIndex = (walletIndexRaw === '2' ? 2 : 1) as WalletIndex;
-      if (!userId || !investments || !pnl) {
-        throw new Error('Missing required flags: --userId, --investments, --pnl');
-      }
-      await registerFlow(rl, walletIndex, { userId, investments, pnl });
+    if (cmd === 'create') {
+      if (!escrowId) throw new Error('Missing required flag: --escrowId');
+      await createEscrowFlow(rl, { escrowId });
       return;
     }
 
-    if (cmd === 'update') {
-      const walletIndexRaw = getArgValue(argv, 'wallet');
-      const walletIndex = (walletIndexRaw === '2' ? 2 : 1) as WalletIndex;
-      if (!userId || !investments || !pnl) {
-        throw new Error('Missing required flags: --userId, --investments, --pnl');
+    if (cmd === 'deposit') {
+      if (!escrowId || !amount) {
+        throw new Error('Missing required flags: --escrowId, --amount');
       }
-      await updateFlow(rl, walletIndex, { userId, investments, pnl });
+      await depositFlow(rl, { escrowId, amount });
+      return;
+    }
+
+    if (cmd === 'release') {
+      if (!escrowId) throw new Error('Missing required flag: --escrowId');
+      await releaseFlow(rl, { escrowId });
+      return;
+    }
+
+    if (cmd === 'refund') {
+      if (!escrowId) throw new Error('Missing required flag: --escrowId');
+      await refundFlow(rl, { escrowId });
       return;
     }
 
     if (cmd === 'read') {
-      if (!userId) throw new Error('Missing required flag: --userId');
-      await readFlow(rl, { userId });
+      if (!escrowId) throw new Error('Missing required flag: --escrowId');
+      await readFlow(rl, { escrowId });
       return;
     }
 
-    console.log('');
-    console.log('Usage:');
-    console.log('  npm run cli -- deploy --wallet 1|2');
-    console.log('  npm run cli -- register --wallet 1|2 --userId <id> --investments <n> --pnl <n>');
-    console.log('  npm run cli -- update --wallet 1|2 --userId <id> --investments <n> --pnl <n>');
-    console.log('  npm run cli -- read --userId <id>');
-    console.log('');
-    console.log('Or run `npm run cli` for the interactive menu.');
+    printUsage();
   } finally {
     rl?.close();
   }
@@ -578,4 +725,3 @@ main().catch((err) => {
   console.error(paint(`Error: ${getErrorReason(err)}`, 'red'));
   process.exit(1);
 });
-
