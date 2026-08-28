@@ -74,7 +74,7 @@ contract EscrowContract {
         // 3. Escrow must be funded
         require(e.status == Status.FUNDED, "Escrow not funded");
 
-        // External call: sends ETH to the buyer's address.
+        // External call: sends ETH to the seller's address.
         // State is updated before this call to prevent reentrancy attacks.
 
         // Effects: Update state before interacting with external accounts
